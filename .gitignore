@@ -1,4 +1,6 @@
 /corpus
+/.idea
+__pycache__/
 
 **/*.tsv
 **/*.csv
