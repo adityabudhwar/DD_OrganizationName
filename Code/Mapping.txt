@@ -1,0 +1,48 @@
+{
+	"settings": {
+		"analysis": {
+			"filter": {
+				"english_stop": {
+					"type": "stop",
+					"stopwords": "stop_words.txt"
+				},
+				"english_stemmer": {
+					"type": "stemmer",
+					"language": "english"
+				}
+			},
+			"analyzer": {
+				"english_analyzer": {
+					"tokenizer": "standard",
+					"filter": [
+						"lowercase",
+                                                "english_stemmer",
+                                                "english_stop"
+					]
+				}
+			}
+		}
+	},
+	"mappings": {
+		"organization_search": {
+			"properties": {
+				"ORG": {
+					"type": "string",
+					"analyzer": "english_analyzer",
+					"search_analyzer": "english_analyzer"
+				},
+				"ORG_E": {
+					"type": "string",
+                                        "index": "not_analyzed"
+				},
+                                "ID" : {
+					"type": "float"
+				},
+                                "ABR" : {
+					"type": "string",
+					"index": "not_analyzed"
+				}
+			}
+		}
+	}
+}
