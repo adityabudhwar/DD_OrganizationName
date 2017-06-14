@@ -2,7 +2,6 @@ import requests
 import untangle
 
 class dbpedia:
-
     def getURI(self, keyword):
         url = "http://lookup.dbpedia.org/api/search.asmx/KeywordSearch?QueryClass=Organisation&QueryString=" + keyword
         result = requests.get(url)
@@ -36,6 +35,9 @@ if __name__ == '__main__':
     dbpedia = dbpedia()
     print(dbpedia.getURI("Adobe"))
     print(dbpedia.getURI("YMCA"))
+    print(dbpedia.getURI("ACLU"))
+    print(dbpedia.getURI('American Civil Liberties Union'))
+    print(dbpedia.getURI('American Civil Liberties Union Northern California'))
     print(dbpedia.getURI("Adobe Systems"))
     print(dbpedia.getURI("Apple"))
     print(dbpedia.getURI("Apple Inc"))

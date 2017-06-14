@@ -7,16 +7,33 @@ with open(sys.argv[1]) as f:
 newNodeList = []
 newEdgeList = []
 
-for group, orgs in data.items():
+orgNums = [(int(group), len(orgs)) for group, orgs in data.items() if len(orgs) < 80]
+orgNums = sorted(orgNums, key=lambda x: x[1], reverse=True)[:120]
+
+for group, numOrgs in orgNums:
     namesList = []
+    orgs = data[str(group)]
     for org in orgs:
-        namesList.append((len(org['name'].split()), org['oid']))
+        namesList.append((len(org['name'].split()), int(org['oid'])))
     namesList = sorted(namesList, key=lambda x: x[0])
     centerId = namesList[0][1]
     for org in orgs:
-        newNodeList.append({'id': org['oid'], 'label': org['name'], 'group': group})
-        if centerId != org['oid']:
-            newEdgeList.append({'from': org['oid'], 'to': centerId})
+        """
+        if centerId != int(org['oid']):
+            newNodeList.append({'id': int(org['oid']), 'value': 15, 'x': float(org['x']), 'y': float(org['y']), 'title': str(org['originalMention']), 'label': str(org['name']), 'group': group})
+            newEdgeList.append({'from': int(org['oid']), 'to': centerId})
+        else:
+            newNodeList.append({'id': int(org['oid']), 'value': 30, 'x': float(org['x']), 'y': float(org['y']), 'title': str(org['originalMention']), 'label': str(org['name']), 'group': group})
+        """
+        if centerId != int(org['oid']):
+            newNodeList.append({'id': int(org['oid']), 'value': 15, 'label': str(org['originalMention']), 'title': 'Name: {}<br>ID: {}'.format(str(org['name']), str(org['oid'])), 'group': group})
+            newEdgeList.append({'from': int(org['oid']), 'to': centerId})
+        else:
+            newNodeList.append({'id': int(org['oid']), 'value': 30, 'label': str(org['originalMention']), 'title': 'Name: {}<br>ID: {}'.format(str(org['name']), str(org['oid'])), 'group': group})
+
+print ('Nodes : {}'.format(len(newNodeList)))
+print ('Edges : {}'.format(len(newEdgeList)))
+print ('Groups : {}'.format(len(orgNums)))
 
 with open('clusterNodes.js', 'w') as f:
     f.write("var nodes = ")
