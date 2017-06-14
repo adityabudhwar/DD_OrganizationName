@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.cluster import DBSCAN, AgglomerativeClustering, AffinityPropagation, KMeans
+from sklearn import manifold
 import editdistance
 import re
 import sys
@@ -9,6 +10,7 @@ import json
 import requests
 import untangle
 import time
+import pathlib
 from joblib import Parallel, delayed
 
 nlp = spacy.load('en')
@@ -205,8 +207,8 @@ def splitAllOrgSections(splitOrgsFile=None, orgNamesDf=None, locationDf=None):
 
             if numMentions % step == 0:
                 print('Processed {}% of orgs'.format(processed * 100 / numMentions))
-        with open(outfile, 'w') as file:
-            json.dump(splitOrgs, file)
+                # with open(outfile, 'w') as file:
+                #     json.dump(splitOrgs, file)
     else:
         raise ValueError('Neither splitOrgsFile nor orgNamesDf was defined')
 
@@ -260,7 +262,7 @@ def computeOrgDistance(splitOrgOne, splitOrgTwo):
     return dist
 
 
-def groupOrgClusters(fitCluster, splitOrgs):
+def groupOrgClusters(fitCluster, splitOrgs, coordinates):
     uniqueClusters = set(fitCluster.labels_)
     groups = {str(clusterId): [] for clusterId in uniqueClusters if clusterId != -1}
 
@@ -269,9 +271,38 @@ def groupOrgClusters(fitCluster, splitOrgs):
         if id != -1:
             groups[str(id)].append({'oid': str(splitOrgs[i]['oid']),
                                     'name': splitOrgs[i]['org'],
-                                    'originalMention': splitOrgs[i]['originalText']})
+                                    'originalMention': splitOrgs[i]['originalText'],
+                                    'x': coordinates[i][0],
+                                    'y': coordinates[i][1]})
 
     return groups
+
+
+def computeCoordsFromDist(distances):
+    coordFile = 'coords.json'
+
+    if pathlib.Path(coordFile).is_file():
+        print('Loading coordinates file')
+        with open(coordFile, 'r') as file:
+            coords = np.array(json.load(file))
+    else:
+        print('Recomputing coordinates')
+        adist = np.array(distances)
+        maxDist = np.amax(adist)
+        adist /= maxDist
+
+        mds = manifold.MDS(n_components=2, dissimilarity='precomputed', n_jobs=-1)
+        results = mds.fit(adist)
+        coords = np.array(results.embedding_)
+
+        with open(coordFile, 'w') as outfile:
+            json.dump(coords.tolist(), outfile)
+    # coords = np.ndarray(shape=distances.shape, dtype=np.float)
+    #
+    # for i in range(len(distances)):
+    #     for j in range(len(distances)):
+    #         coords[i][j] = (np.square(distances[0][j]) + np.square(distances[i][0]) - np.square(distances[i][j])) / 2
+    return coords
 
 
 def runDBScan(splitOrgs, eps=40.0, distanceFile=None):
@@ -305,12 +336,15 @@ def runDBScan(splitOrgs, eps=40.0, distanceFile=None):
         with open('distances.json', 'w') as distFile:
             json.dump(distances.tolist(), distFile)
     else:
+        print('Loading distance file')
         with open(distanceFile, 'r') as file:
             distances = np.array(json.load(file))
 
+    coords = computeCoordsFromDist(distances) * 500
+    print(coords)
     cluster = DBSCAN(eps=eps, min_samples=1)
     cluster.fit(distances)
-    groups = groupOrgClusters(cluster, splitOrgs)
+    groups = groupOrgClusters(cluster, splitOrgs, coords)
     return groups
 
 
@@ -527,13 +561,13 @@ def main(argv):
     print(orgNamesDf.columns)
     print('Location unique types:', locationDf.type.unique())
     print(locationDf.head())
-
+    #
     splitOrgs = splitAllOrgSections(orgNamesDf=orgNamesDf, locationDf=locationDf)
     # splitOrgs = splitAllOrgSections(splitOrgsFile='splitOrgs.json')
-
-
+    # splitOrgs = splitAllOrgSections(splitOrgsFile='splitOrgs_gold.json')
 
     # groups = runDBScan(splitOrgs, 'distances.json')
+    # groups = runDBScan(splitOrgs, distanceFile='distances_gold.json')
     groups = runDBScan(splitOrgs, 40.0)
 
     with open('clusterOut.json', 'w') as clusterOutfile:
