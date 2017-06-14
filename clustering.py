@@ -6,8 +6,48 @@ import re
 import sys
 import spacy
 import json
+import requests
+import untangle
+import time
+from joblib import Parallel, delayed
 
 nlp = spacy.load('en')
+
+
+class DBPedia:
+    def __init__(self, endpoint):
+        self.endpoint = endpoint + '/api/search.asmx/KeywordSearch?QueryClass=Organisation&QueryString='
+
+    def getURI(self, keyword):
+        url = self.endpoint + keyword
+
+        try:
+            result = requests.get(url, timeout=1)
+            d = untangle.parse(result.content.decode("utf-8"))
+            if hasattr(d.ArrayOfResult, 'Result'):
+                all_r = "#####".join(Result.URI.cdata for Result in d.ArrayOfResult.Result)
+            else:
+                all_r = ""
+            all_r = all_r.split("#####")
+            if len(all_r) == 0:
+                return None
+            else:
+                return all_r[0]
+        except:
+            print('Failed to retrieve URI for', keyword)
+            return None
+
+    def getURIDict(self, dataframe, output_file):
+        fd = open(output_file, "w")
+        for index, row in dataframe.iterrows():
+            uri = self.getURI(row['name'])
+            str1 = str(row['oid']) + "\t" + row['name']
+            if uri:
+                str1 = str1 + "\t" + uri
+            else:
+                str1 = str1 + "\t" + ""
+            fd.write(str1 + "\n")
+        fd.close()
 
 
 def _addLocation(oid, label, remainingText, fullText, loc, statesDf):
@@ -15,14 +55,10 @@ def _addLocation(oid, label, remainingText, fullText, loc, statesDf):
         loc
     ))
     matches = qualifierRE.finditer(remainingText)
-    # index = remainingText.find(loc)
     locations = []
 
     if matches:
         for match in matches:
-            locMatch = match.group(1)
-            # expandLocationAbbrev(locMatch, statesDf)
-            # print('Match:', match.group(0))
             remainingText = remainingText[:match.start(0)] + remainingText[match.end(0):]
             remainingText = remainingText.strip()
             locations.append({
@@ -40,16 +76,12 @@ def expandLocationAbbrev(loc, statesDf):
     abbrevMatch = statesDf.State.loc[statesDf.Abbreviation == loc]
 
     if not abbrevMatch.empty:
-        print('Found abbreviation match for {}: {}'.format(loc, str(abbrevMatch)))
         loc = str(abbrevMatch)
 
     return loc
 
 
 def getLocationDf(dataframe, forceReload=False):
-    """
-    TODO: Also look for qualifiers like 'northern', 'eastern', 'western', 'southern', etc.
-    """
     locationDfFile = 'dd_org_ents.csv'
 
     if forceReload:
@@ -57,20 +89,21 @@ def getLocationDf(dataframe, forceReload=False):
 
         locationRows = []
         for index, oid, name in dataframe.itertuples():
-            # print(row)
             doc = nlp(str(name))
             newLocations = []
             remainingText = str(doc.text)
+            locationNames = set()
 
             for ent in doc.ents:
                 if ent.label_ == 'LOC' or ent.label_ == 'GPE':
-                    # expandLocationAbbrev(ent.text, states)
-                    remainingText = remainingText[:ent.start] + remainingText[ent.end:]
+                    remainingText = remainingText[:ent.start_char] + remainingText[ent.end_char:]
                     remainingText = remainingText.strip()
+                    entText = str(ent.text).strip()
+                    locationNames.add(entText)
                     newLocations.append({
                         'oid': oid,
                         'type': ent.label_,
-                        'text': str(ent.text).strip(),
+                        'text': entText,
                         'startIndex': ent.start_char,
                         'endIndex': ent.end_char
                     })
@@ -79,7 +112,8 @@ def getLocationDf(dataframe, forceReload=False):
             for index, state, abbrev in states.itertuples():
                 remainingText, locations = _addLocation(oid, 'LOC', lowerText, remainingText.lower(), state, states)
                 newLocations.extend(locations)
-                remainingText, locations = _addLocation(oid, 'LOC', remainingText.lower(), ent.text, abbrev, states)
+
+                remainingText, locations = _addLocation(oid, 'LOC', remainingText.lower(), lowerText, abbrev, states)
                 newLocations.extend(locations)
 
             locationRows.extend(newLocations)
@@ -97,9 +131,11 @@ def cleanOrgName(org):
     if '&' in org:
         org = org.replace('&', 'and')
     if '.' in org:
-        org = org.replace('.', "")
+        org = org.replace('.', '')
     if ',' in org:
-        org = org.replace(',', "")
+        org = org.replace(',', '')
+    if '/' in org:
+        org = org.replace('/', '')
     return org
 
 
@@ -108,42 +144,74 @@ def splitOrgSections(orgMention, oid, locationDf):
     Split the org mention into the location, organization qualifier (llc, co., inc., etc.),
         and the primary organization name with location and org qualifier removed
 
-    :return {locations: list, qualifiers: list, org: str, originalText: str, oid: int}
+    :return {locations: list, qualifiers: list, org: str, orgURI: str, originalText: str, oid: int}
     """
 
-    # print('Org mention:', orgMention)
     thisLocDf = locationDf[locationDf.oid == oid]
     remainingText = str(orgMention)
     locations = []
 
     if not thisLocDf.empty:
-        # print(thisLocDf)
         for idx, endIndex, oid, startIndex, text, type in thisLocDf.itertuples():
             locations.append(text.lower())
             remainingText = remainingText[:startIndex] + remainingText[endIndex:]
 
-            # print('org mention with locations removed:', remainingText)
-
     orgQualifiers = []
-    for m in re.finditer(r'\s+(co\.|ltd|lp|llc|inc|pac|assn|political action committee)\.?', remainingText.lower()):
-        # print('Qualifier match:', m.group(1))
+    for m in re.finditer(r'\s+(co\.|ltd|lp|llc|inc|pac|assn|political action committee)\.?',
+                         remainingText.lower()):  # print('Qualifier match:', m.group(1))
         remainingText = remainingText[:m.start()] + remainingText[m.end():]
         orgQualifiers.append(m.group(1).strip())
 
     processedMention = nlp(remainingText)
-    # print('Spacy processed mention:', processedMention)
     mentionWords = [str(word.lemma_) for word in processedMention
                     if not word.is_stop and not word.is_punct
                     and not word.is_space]
-    # print('Mention words:', mentionWords)
     org = cleanOrgName(' '.join(mentionWords))
-    # print('Org mention stop words removed:', org)
+    dbpedia = DBPedia('http://localhost:1111')
+    uri = dbpedia.getURI(org)
+
+    if not uri:
+        uri = None
+    else:
+        splitURI = uri.split('/')[-1].split('_')
+        uri = ' '.join(splitURI)
 
     return {'locations': locations,
             'qualifiers': orgQualifiers,
             'org': org,
+            'orgURI': uri,
             'originalText': orgMention,
-            'oid': oid}
+            'oid': str(oid)}
+
+
+def splitAllOrgSections(splitOrgsFile=None, orgNamesDf=None, locationDf=None):
+    if splitOrgsFile is not None:
+        with open(splitOrgsFile, 'r') as file:
+            splitOrgs = json.load(file)
+    elif orgNamesDf is not None and locationDf is not None:
+        outfile = 'splitOrgs.json'
+        splitOrgs = []
+        numMentions = len(orgNamesDf)
+        step = int(numMentions / 100)
+        if step == 0:
+            step = 1
+
+        processed = 0
+
+        for idx, oid, name in orgNamesDf.itertuples():
+            split = splitOrgSections(name, oid, locationDf)
+            splitOrgs.append(split)
+            processed += 1
+
+            if numMentions % step == 0:
+                print('Processed {}% of orgs'.format(processed * 100 / numMentions))
+        with open(outfile, 'w') as file:
+            json.dump(splitOrgs, file)
+    else:
+        raise ValueError('Neither splitOrgsFile nor orgNamesDf was defined')
+
+    print('SplitAllOrgSections finished')
+    return splitOrgs
 
 
 def computeWordListDistance(listOne, listTwo):
@@ -163,42 +231,31 @@ def computeOrgDistance(splitOrgOne, splitOrgTwo):
     :param splitOrgTwo: {locations: list, qualifier: str, org}
     :return: distance between splitOrgOne and splitOrgTwo
     """
-    # {locations: list, qualifiers: list, org: str, oid: int}
+
     dist = 0.0
-    orgWeight = 10.0
+    orgWeight = 100.0
     qualifierWeight = 1.0
     locationWeight = 2.0
 
     orgNameOne, orgNameTwo = splitOrgOne['org'], splitOrgTwo['org']
     qualifiersOne, qualifiersTwo = splitOrgOne['qualifiers'], splitOrgTwo['qualifiers']
     locationsOne, locationsTwo = splitOrgOne['locations'], splitOrgTwo['locations']
+    orgOneURI, orgTwoURI = splitOrgOne['orgURI'], splitOrgTwo['orgURI']
 
-    # if orgNameOne == orgNameTwo:
-    #     orgDist = 0.0
-    # Org names aren't equal, but one is a subset of the other
-    # elif orgNameOne in orgNameTwo or orgNameTwo in orgNameOne:
-    #     orgWeight = 1.0
-
-    spacyOrgOne, spacyOrgTwo = nlp(orgNameOne), nlp(orgNameTwo)
-    # print('Similarity of {} to {}: {}'.format(orgNameOne, orgNameTwo,
-    #                                           spacyOrgOne.similarity(spacyOrgTwo)))
-    # orgOneWords, orgTwoWords = orgNameOne.split(), orgNameTwo.split()
-    # orgWordsDist = computeWordListDistance(orgOneWords, orgTwoWords)
-    #
-    # char_distance = editdistance.eval(orgNameOne, orgNameTwo)
-    # if char_distance != 0:
-    #     char_distance = float(char_distance) / max(len(orgNameOne), len(orgNameTwo))
-
-    # dist += orgWeight * (orgWordsDist + 1) * char_distance
+    # If DBPedia found the URI, compare those, otherwise compare retrieved org names
+    if orgOneURI is not None and orgTwoURI is not None:
+        spacyOrgOne, spacyOrgTwo = nlp.make_doc(orgOneURI), nlp.make_doc(orgTwoURI)
+    else:
+        spacyOrgOne, spacyOrgTwo = nlp.make_doc(orgNameOne), nlp.make_doc(orgNameTwo)
 
     # Spacy doc distance = cosine similarity
-    dist += orgWeight / spacyOrgOne.similarity(spacyOrgTwo)
+    orgSimilarity = spacyOrgOne.similarity(spacyOrgTwo)
+
+    if orgSimilarity < 1:
+        dist += orgWeight * (1 - orgSimilarity)
+
     dist += qualifierWeight * computeWordListDistance(qualifiersOne, qualifiersTwo)
     dist += locationWeight * computeWordListDistance(locationsOne, locationsTwo)
-
-    print('Distance from {} to {}: {}'.format(splitOrgOne['originalText'],
-                                              splitOrgTwo['originalText'],
-                                              str(dist)))
 
     return dist
 
@@ -214,34 +271,45 @@ def groupOrgClusters(fitCluster, splitOrgs):
                                     'name': splitOrgs[i]['org'],
                                     'originalMention': splitOrgs[i]['originalText']})
 
-    print('Cluster groups:', groups)
     return groups
 
 
-def runDBScan(splitOrgs, distanceFile=None):
+def runDBScan(splitOrgs, eps=40.0, distanceFile=None):
     if distanceFile is None:
         distances = np.ndarray(shape=(len(splitOrgs), len(splitOrgs)), dtype=np.float)
+        start = int(time.time()) * 1000
+        orgCombinations = [(orgOne, orgTwo) for j, orgTwo in enumerate(splitOrgs)
+                           for i, orgOne in enumerate(splitOrgs)]
+        distances_1D = Parallel(n_jobs=-1)(delayed(computeOrgDistance)(*orgCombo) for orgCombo in orgCombinations)
+        numSplitOrgs = len(splitOrgs)
+
+        for i in range(numSplitOrgs):
+            for j in range(numSplitOrgs):
+                distances[i][j] = distances_1D[i * numSplitOrgs + j]
+
+        """
+        Old single-threaded distance computation:
 
         for i, orgOne in enumerate(splitOrgs):
             for j, orgTwo in enumerate(splitOrgs):
-                distances[i][j] = computeOrgDistance(orgOne, orgTwo)
+                if i == j:
+                    distances[i][j] = 0.0
+                else:
+                    distances[i][j] = computeOrgDistance(orgOne, orgTwo)
+        """
 
-        print('distances:', distances)
+        print('Finished computing distances in {}ms'.format(
+            int(time.time()) * 1000 - start
+        ))
+
         with open('distances.json', 'w') as distFile:
             json.dump(distances.tolist(), distFile)
-            # distances = np.array([[editdistance.eval(orgOne, orgTwo)
-            #                    for orgOne in splitOrgs]
-            #                   for orgTwo in splitOrgs],
-            #                  dtype=float)
     else:
         with open(distanceFile, 'r') as file:
             distances = np.array(json.load(file))
 
-    # with open('editDistances.json', 'w') as distanceOutfile:
-    #     json.dump(distances, distanceOutfile)
-    cluster = DBSCAN(eps=20.0, min_samples=1)
+    cluster = DBSCAN(eps=eps, min_samples=1)
     cluster.fit(distances)
-    print('Labels:', cluster.labels_)
     groups = groupOrgClusters(cluster, splitOrgs)
     return groups
 
@@ -453,29 +521,20 @@ def main(argv):
     orgNamesDf = pd.read_csv(argv[1],
                              dtype={'name': str},
                              sep='\t')
-    locationDf = getLocationDf(orgNamesDf)
+    print('Clustering {} orgs'.format(len(orgNamesDf)))
+    locationDf = getLocationDf(orgNamesDf, True)
     print(orgNamesDf.head())
     print(orgNamesDf.columns)
     print('Location unique types:', locationDf.type.unique())
     print(locationDf.head())
 
-    splitOrgs = []
-    for idx, oid, name in orgNamesDf.itertuples():
-        split = splitOrgSections(name, oid, locationDf)
-        splitOrgs.append(split)
-    # print(splitOrgs)
+    splitOrgs = splitAllOrgSections(orgNamesDf=orgNamesDf, locationDf=locationDf)
+    # splitOrgs = splitAllOrgSections(splitOrgsFile='splitOrgs.json')
 
 
 
     # groups = runDBScan(splitOrgs, 'distances.json')
-    groups = runDBScan(splitOrgs)
-
-    # ddorgtools.clusterData(orgNamesDf, locationDf)
-    # ddorgtools.findTopFrequencyWords(orgNamesDf, "matrix.csv")
-    # cluster = ddorgtools.levenshteinCluster(orgNamesDf)
-    # groups = ddorgtools.kMeansCluster(orgNamesDf, int(len(orgNamesDf) * .15))
-    # groups = ddorgtools.groupEntities(cluster, orgNamesDf)
-    # print(ddorgtools.getDistance("Hello There World. llc xyz", "Hello World llc"))
+    groups = runDBScan(splitOrgs, 40.0)
 
     with open('clusterOut.json', 'w') as clusterOutfile:
         json.dump(groups, clusterOutfile)

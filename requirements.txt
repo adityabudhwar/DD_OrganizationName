@@ -4,3 +4,4 @@ sklearn
 editdistance
 joblib
 untangle
+spacy
