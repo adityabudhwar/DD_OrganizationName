@@ -5,63 +5,245 @@ import editdistance
 import re
 import sys
 import spacy
+import json
 
 nlp = spacy.load('en')
 
 
-def _addLocation(oid, label, remainingText, fullText, loc):
-    index = remainingText.find(loc)
+def _addLocation(oid, label, remainingText, fullText, loc, statesDf):
+    qualifierRE = re.compile(r'(?:west|western|north|northern|east|eastern|south|southern|central)?\s*({})'.format(
+        loc
+    ))
+    matches = qualifierRE.finditer(remainingText)
+    # index = remainingText.find(loc)
     locations = []
 
-    if index > 0:
-        remainingText = remainingText[:index] + remainingText[index + len(loc):]
-        locations.append({
-            'oid': oid,
-            'type': label,
-            'text': fullText,
-            'startIndex': index,
-            'endIndex': index + len(loc)
-        })
+    if matches:
+        for match in matches:
+            locMatch = match.group(1)
+            # expandLocationAbbrev(locMatch, statesDf)
+            # print('Match:', match.group(0))
+            remainingText = remainingText[:match.start(0)] + remainingText[match.end(0):]
+            remainingText = remainingText.strip()
+            locations.append({
+                'oid': oid,
+                'type': label,
+                'text': match.group(0).strip(),
+                'startIndex': match.start(0),
+                'endIndex': match.end(0)
+            })
     return remainingText, locations
 
 
-def createLocationDf(dataframe):
+def expandLocationAbbrev(loc, statesDf):
+    loc = loc.upper()
+    abbrevMatch = statesDf.State.loc[statesDf.Abbreviation == loc]
+
+    if not abbrevMatch.empty:
+        print('Found abbreviation match for {}: {}'.format(loc, str(abbrevMatch)))
+        loc = str(abbrevMatch)
+
+    return loc
+
+
+def getLocationDf(dataframe, forceReload=False):
     """
     TODO: Also look for qualifiers like 'northern', 'eastern', 'western', 'southern', etc.
     """
-    states = pd.read_csv('states.csv')
+    locationDfFile = 'dd_org_ents.csv'
 
-    locationRows = []
-    for index, oid, name in dataframe.itertuples():
-        # print(row)
-        doc = nlp(str(name))
-        newLocations = []
-        remainingText = str(doc.text)
+    if forceReload:
+        states = pd.read_csv('states.csv')
 
-        for ent in doc.ents:
-            remainingText = remainingText[:ent.start] + remainingText[ent.end:]
-            newLocations.append({
-                'oid': oid,
-                'type': ent.label_,
-                'text': ent.text,
-                'startIndex': ent.start_char,
-                'endIndex': ent.end_char
-            })
+        locationRows = []
+        for index, oid, name in dataframe.itertuples():
+            # print(row)
+            doc = nlp(str(name))
+            newLocations = []
+            remainingText = str(doc.text)
 
-        lowerText = remainingText.lower()
-        for index, state, abbrev in states.itertuples():
-            remainingText, locations = _addLocation(oid, 'LOC', lowerText, ent.text, state)
-            newLocations.extend(locations)
-            remainingText, locations = _addLocation(oid, 'LOC', remainingText.lower(), ent.text, abbrev)
-            newLocations.extend(locations)
+            for ent in doc.ents:
+                if ent.label_ == 'LOC' or ent.label_ == 'GPE':
+                    # expandLocationAbbrev(ent.text, states)
+                    remainingText = remainingText[:ent.start] + remainingText[ent.end:]
+                    remainingText = remainingText.strip()
+                    newLocations.append({
+                        'oid': oid,
+                        'type': ent.label_,
+                        'text': str(ent.text).strip(),
+                        'startIndex': ent.start_char,
+                        'endIndex': ent.end_char
+                    })
 
-        locationRows.extend(newLocations)
+            lowerText = remainingText.lower()
+            for index, state, abbrev in states.itertuples():
+                remainingText, locations = _addLocation(oid, 'LOC', lowerText, remainingText.lower(), state, states)
+                newLocations.extend(locations)
+                remainingText, locations = _addLocation(oid, 'LOC', remainingText.lower(), ent.text, abbrev, states)
+                newLocations.extend(locations)
 
-    locationDf = pd.DataFrame(locationRows)
-    locationDf.to_csv('dd_org_ents.csv', sep=',', index=False)
-    print('Finished creating location DF')
+            locationRows.extend(newLocations)
+
+        locationDf = pd.DataFrame(locationRows)
+        locationDf.to_csv(locationDfFile, sep=',', index=False)
+        print('Finished creating location DF')
+    else:
+        locationDf = pd.read_csv(locationDfFile)
 
     return locationDf
+
+
+def cleanOrgName(org):
+    if '&' in org:
+        org = org.replace('&', 'and')
+    if '.' in org:
+        org = org.replace('.', "")
+    if ',' in org:
+        org = org.replace(',', "")
+    return org
+
+
+def splitOrgSections(orgMention, oid, locationDf):
+    """
+    Split the org mention into the location, organization qualifier (llc, co., inc., etc.),
+        and the primary organization name with location and org qualifier removed
+
+    :return {locations: list, qualifiers: list, org: str, originalText: str, oid: int}
+    """
+
+    # print('Org mention:', orgMention)
+    thisLocDf = locationDf[locationDf.oid == oid]
+    remainingText = str(orgMention)
+    locations = []
+
+    if not thisLocDf.empty:
+        # print(thisLocDf)
+        for idx, endIndex, oid, startIndex, text, type in thisLocDf.itertuples():
+            locations.append(text.lower())
+            remainingText = remainingText[:startIndex] + remainingText[endIndex:]
+
+            # print('org mention with locations removed:', remainingText)
+
+    orgQualifiers = []
+    for m in re.finditer(r'\s+(co\.|ltd|lp|llc|inc|pac|assn|political action committee)\.?', remainingText.lower()):
+        # print('Qualifier match:', m.group(1))
+        remainingText = remainingText[:m.start()] + remainingText[m.end():]
+        orgQualifiers.append(m.group(1).strip())
+
+    processedMention = nlp(remainingText)
+    # print('Spacy processed mention:', processedMention)
+    mentionWords = [str(word.lemma_) for word in processedMention
+                    if not word.is_stop and not word.is_punct
+                    and not word.is_space]
+    # print('Mention words:', mentionWords)
+    org = cleanOrgName(' '.join(mentionWords))
+    # print('Org mention stop words removed:', org)
+
+    return {'locations': locations,
+            'qualifiers': orgQualifiers,
+            'org': org,
+            'originalText': orgMention,
+            'oid': oid}
+
+
+def computeWordListDistance(listOne, listTwo):
+    numDifferentWords = 0
+
+    for wordOne in listOne:
+        for wordTwo in listTwo:
+            if wordOne != wordTwo:
+                numDifferentWords += 1
+
+    return numDifferentWords
+
+
+def computeOrgDistance(splitOrgOne, splitOrgTwo):
+    """
+    :param splitOrgOne: {locations: list, qualifier: str, org}
+    :param splitOrgTwo: {locations: list, qualifier: str, org}
+    :return: distance between splitOrgOne and splitOrgTwo
+    """
+    # {locations: list, qualifiers: list, org: str, oid: int}
+    dist = 0.0
+    orgWeight = 10.0
+    qualifierWeight = 1.0
+    locationWeight = 2.0
+
+    orgNameOne, orgNameTwo = splitOrgOne['org'], splitOrgTwo['org']
+    qualifiersOne, qualifiersTwo = splitOrgOne['qualifiers'], splitOrgTwo['qualifiers']
+    locationsOne, locationsTwo = splitOrgOne['locations'], splitOrgTwo['locations']
+
+    # if orgNameOne == orgNameTwo:
+    #     orgDist = 0.0
+    # Org names aren't equal, but one is a subset of the other
+    # elif orgNameOne in orgNameTwo or orgNameTwo in orgNameOne:
+    #     orgWeight = 1.0
+
+    spacyOrgOne, spacyOrgTwo = nlp(orgNameOne), nlp(orgNameTwo)
+    # print('Similarity of {} to {}: {}'.format(orgNameOne, orgNameTwo,
+    #                                           spacyOrgOne.similarity(spacyOrgTwo)))
+    # orgOneWords, orgTwoWords = orgNameOne.split(), orgNameTwo.split()
+    # orgWordsDist = computeWordListDistance(orgOneWords, orgTwoWords)
+    #
+    # char_distance = editdistance.eval(orgNameOne, orgNameTwo)
+    # if char_distance != 0:
+    #     char_distance = float(char_distance) / max(len(orgNameOne), len(orgNameTwo))
+
+    # dist += orgWeight * (orgWordsDist + 1) * char_distance
+
+    # Spacy doc distance = cosine similarity
+    dist += orgWeight / spacyOrgOne.similarity(spacyOrgTwo)
+    dist += qualifierWeight * computeWordListDistance(qualifiersOne, qualifiersTwo)
+    dist += locationWeight * computeWordListDistance(locationsOne, locationsTwo)
+
+    print('Distance from {} to {}: {}'.format(splitOrgOne['originalText'],
+                                              splitOrgTwo['originalText'],
+                                              str(dist)))
+
+    return dist
+
+
+def groupOrgClusters(fitCluster, splitOrgs):
+    uniqueClusters = set(fitCluster.labels_)
+    groups = {str(clusterId): [] for clusterId in uniqueClusters if clusterId != -1}
+
+    for i, id in enumerate(fitCluster.labels_):
+        # cluster ID == -1 means the point is seen as noise
+        if id != -1:
+            groups[str(id)].append({'oid': str(splitOrgs[i]['oid']),
+                                    'name': splitOrgs[i]['org'],
+                                    'originalMention': splitOrgs[i]['originalText']})
+
+    print('Cluster groups:', groups)
+    return groups
+
+
+def runDBScan(splitOrgs, distanceFile=None):
+    if distanceFile is None:
+        distances = np.ndarray(shape=(len(splitOrgs), len(splitOrgs)), dtype=np.float)
+
+        for i, orgOne in enumerate(splitOrgs):
+            for j, orgTwo in enumerate(splitOrgs):
+                distances[i][j] = computeOrgDistance(orgOne, orgTwo)
+
+        print('distances:', distances)
+        with open('distances.json', 'w') as distFile:
+            json.dump(distances.tolist(), distFile)
+            # distances = np.array([[editdistance.eval(orgOne, orgTwo)
+            #                    for orgOne in splitOrgs]
+            #                   for orgTwo in splitOrgs],
+            #                  dtype=float)
+    else:
+        with open(distanceFile, 'r') as file:
+            distances = np.array(json.load(file))
+
+    # with open('editDistances.json', 'w') as distanceOutfile:
+    #     json.dump(distances, distanceOutfile)
+    cluster = DBSCAN(eps=20.0, min_samples=1)
+    cluster.fit(distances)
+    print('Labels:', cluster.labels_)
+    groups = groupOrgClusters(cluster, splitOrgs)
+    return groups
 
 
 class DDOrgTools:
@@ -135,9 +317,21 @@ class DDOrgTools:
         if org2Matches:
             pass
 
-    def getDistanceCombined(self, org1, org2):
+    def getDistanceCombined(self, org1, org2, locationDf):
+        # TODO: if one org is a subset of other org, should be very close match
+        oid_1, org1 = org1
+        oid_2, org2 = org2
+
         org1 = str(org1)
         org2 = str(org2)
+
+        org_one_locs = locationDf[locationDf.oid == oid_1]
+        org_two_locs = locationDf[locationDf.oid == oid_2]
+
+        if not org_one_locs.empty:
+            print('Org one locs:', org_one_locs)
+        if not org_two_locs.empty:
+            print('Org two locs:', org_two_locs)
         # self.tryExpandAcronyms(org1, org2)
         # print(org1)
         # print(org2)
@@ -158,24 +352,25 @@ class DDOrgTools:
         distance = word_distance * char_distance
         return distance
 
-    def clusterData(self, dataframe):
+    def clusterData(self, dataframe, locationDf):
         # Preprocess the data to remove the junk org names
         # filterd_data = np.asarray(self.preprocess(dataframe.name.values))
         # print(filterd_data)
-        filterd_data = dataframe.name.values
+        filteredData = dataframe.values
         # create the distance matrix
-        distances = -1 * np.array([[self.getDistanceCombined(orgOne, orgTwo)
-                                    for orgOne in filterd_data]
-                                   for orgTwo in filterd_data],
+        distances = -1 * np.array([[(orgOne, orgTwo, locationDf)
+                                    for orgOne in filteredData]
+                                   for orgTwo in filteredData],
                                   dtype=float)
 
-        affprop = AffinityPropagation(affinity="precomputed", damping=0.5)
+        # affprop = AffinityPropagation(affinity="precomputed", damping=0.5)
         # affprop = AgglomerativeClustering(n_clusters=500, affinity='precomputed', linkage='complete')
+        cluster = DBSCAN(eps=10, min_samples=2)
 
-        affprop.fit(distances)
-        for cluster_id in np.unique(affprop.labels_):
+        cluster.fit(distances)
+        for cluster_id in np.unique(cluster.labels_):
             # exemplar = filterd_data[affprop.cluster_centers_indices_[cluster_id]]
-            cluster = filterd_data[np.nonzero(affprop.labels_ == cluster_id)]
+            cluster = filteredData[np.nonzero(cluster.labels_ == cluster_id)]
             # cluster_str = ", ".join(cluster)
             # print(" - *%s:* %s" % (exemplar, str(cluster)))
             print("Cluster: " + str(cluster))
@@ -185,11 +380,13 @@ class DDOrgTools:
                                for orgOne in dataframe.name.values]
                               for orgTwo in dataframe.name.values],
                              dtype=float)
+        # with open('editDistances.json', 'w') as distanceOutfile:
+        #     json.dump(distances, distanceOutfile)
         cluster = KMeans(k, n_jobs=-1)
         cluster.fit(distances)
         print('Labels:', cluster.labels_)
         groups = self.groupEntities(cluster, dataframe)
-        return cluster
+        return groups
 
     def levenshteinCluster(self, dataframe, maxDist=2):
 
@@ -214,13 +411,13 @@ class DDOrgTools:
 
     def groupEntities(self, fitCluster, dataframe):
         uniqueClusters = set(fitCluster.labels_)
-        groups = {clusterId: [] for clusterId in uniqueClusters if clusterId != -1}
+        groups = {str(clusterId): [] for clusterId in uniqueClusters if clusterId != -1}
 
         for i, id in enumerate(fitCluster.labels_):
             # cluster ID == -1 means the point is seen as noise
             if id != -1:
-                groups[id].append({'oid': dataframe.oid.values[i],
-                                   'name': dataframe.name.values[i]})
+                groups[str(id)].append({'oid': str(dataframe.oid.values[i]),
+                                        'name': dataframe.name.values[i]})
 
         print('Cluster groups:', groups)
         return groups
@@ -256,17 +453,32 @@ def main(argv):
     orgNamesDf = pd.read_csv(argv[1],
                              dtype={'name': str},
                              sep='\t')
-    # orgNamesDf['Locations'] = orgNamesDf.apply(createLocationDf)
-    locationDf = createLocationDf(orgNamesDf)
-    # orgNamesDf.to_csv('dd_org_loc_samples.csv', sep=',')
-    # print(orgNamesDf.Locations)
-    ddorgtools = DDOrgTools()
-    # ddorgtools.clusterData(orgNamesDf)
+    locationDf = getLocationDf(orgNamesDf)
+    print(orgNamesDf.head())
+    print(orgNamesDf.columns)
+    print('Location unique types:', locationDf.type.unique())
+    print(locationDf.head())
+
+    splitOrgs = []
+    for idx, oid, name in orgNamesDf.itertuples():
+        split = splitOrgSections(name, oid, locationDf)
+        splitOrgs.append(split)
+    # print(splitOrgs)
+
+
+
+    # groups = runDBScan(splitOrgs, 'distances.json')
+    groups = runDBScan(splitOrgs)
+
+    # ddorgtools.clusterData(orgNamesDf, locationDf)
     # ddorgtools.findTopFrequencyWords(orgNamesDf, "matrix.csv")
     # cluster = ddorgtools.levenshteinCluster(orgNamesDf)
-    # cluster = ddorgtools.kMeansCluster(orgNamesDf, int(len(orgNamesDf) * .15))
+    # groups = ddorgtools.kMeansCluster(orgNamesDf, int(len(orgNamesDf) * .15))
     # groups = ddorgtools.groupEntities(cluster, orgNamesDf)
     # print(ddorgtools.getDistance("Hello There World. llc xyz", "Hello World llc"))
+
+    with open('clusterOut.json', 'w') as clusterOutfile:
+        json.dump(groups, clusterOutfile)
 
 
 if __name__ == '__main__':
