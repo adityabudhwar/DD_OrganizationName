@@ -1,6 +1,9 @@
 # Digital Democracy Organization Disambiguation
 
 ## Contributors
+- Brandon Cooper
+- Aditya Budhwar
+- James Caudill
 
 ## Running Search
 - Run Elasticsearch:
